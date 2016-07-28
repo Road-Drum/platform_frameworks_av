@@ -419,8 +419,6 @@ MediaCodecSource::MediaCodecSource(
       mEncoderDataSpace(0),
       mGraphicBufferConsumer(consumer),
       mInputBufferTimeOffsetUs(0),
-      mFirstSampleSystemTimeUs(-1ll),
-      mPausePending(false),
       mFirstSampleTimeUs(-1ll),
       mGeneration(0) {
     CHECK(mLooper != NULL);
@@ -659,18 +657,16 @@ status_t MediaCodecSource::feedEncoderInputBuffers() {
 
         if (mbuf != NULL) {
             CHECK(mbuf->meta_data()->findInt64(kKeyTime, &timeUs));
-            if (mFirstSampleSystemTimeUs < 0ll) {
-                mFirstSampleSystemTimeUs = systemTime() / 1000;
-                if (mPausePending) {
-                    mPausePending = false;
-                    onPause();
-                    mbuf->release();
-                    mAvailEncoderInputIndices.push_back(bufferIndex);
-                    return OK;
-                }
-            }
-
             timeUs += mInputBufferTimeOffsetUs;
+
+            // Due to the extra delay adjustment at the beginning of start/resume,
+            // the adjusted timeUs may be negative if MediaCodecSource goes into pause
+            // state before feeding any buffers to the encoder. Drop the buffer in this
+            // case.
+            if (timeUs < 0) {
+                mbuf->release();
+                return OK;
+            }
 
             // push decoding time for video, or drift time for audio
             if (mIsVideo) {
@@ -680,6 +676,7 @@ status_t MediaCodecSource::feedEncoderInputBuffers() {
                 if (mFirstSampleTimeUs < 0ll) {
                     mFirstSampleTimeUs = timeUs;
                 }
+
                 int64_t driftTimeUs = 0;
                 if (mbuf->meta_data()->findInt64(kKeyDriftTime, &driftTimeUs)
                         && driftTimeUs) {
@@ -731,10 +728,6 @@ status_t MediaCodecSource::onStart(MetaData *params) {
 
     if (mStarted) {
         ALOGI("MediaCodecSource (%s) resuming", mIsVideo ? "video" : "audio");
-        if (mPausePending) {
-            mPausePending = false;
-            return OK;
-        }
         if (mIsVideo) {
             mEncoder->requestIDRFrame();
         }
@@ -779,15 +772,6 @@ status_t MediaCodecSource::onStart(MetaData *params) {
 
     mStarted = true;
     return OK;
-}
-
-void MediaCodecSource::onPause() {
-    if (mFlags & FLAG_USE_SURFACE_INPUT) {
-        suspend();
-    } else {
-        CHECK(mPuller != NULL);
-        mPuller->pause();
-    }
 }
 
 void MediaCodecSource::onMessageReceived(const sp<AMessage> &msg) {
@@ -859,8 +843,7 @@ void MediaCodecSource::onMessageReceived(const sp<AMessage> &msg) {
             }
 
             MediaBuffer *mbuf = new MediaBuffer(outbuf->size());
-            mbuf->setObserver(this);
-            mbuf->add_ref();
+            memcpy(mbuf->data(), outbuf->data(), outbuf->size());
 
             if (!(flags & MediaCodec::BUFFER_FLAG_CODECCONFIG)) {
                 if (mIsVideo) {
@@ -911,7 +894,8 @@ void MediaCodecSource::onMessageReceived(const sp<AMessage> &msg) {
             if (flags & MediaCodec::BUFFER_FLAG_SYNCFRAME) {
                 mbuf->meta_data()->setInt32(kKeyIsSyncFrame, true);
             }
-            memcpy(mbuf->data(), outbuf->data(), outbuf->size());
+            mbuf->setObserver(this);
+            mbuf->add_ref();
 
             {
                 Mutexed<Output>::Locked output(mOutput);
@@ -1002,10 +986,11 @@ void MediaCodecSource::onMessageReceived(const sp<AMessage> &msg) {
 
     case kWhatPause:
     {
-        if (mFirstSampleSystemTimeUs < 0) {
-            mPausePending = true;
+        if (mFlags & FLAG_USE_SURFACE_INPUT) {
+            suspend();
         } else {
-            onPause();
+            CHECK(mPuller != NULL);
+            mPuller->pause();
         }
         break;
     }
@@ -1013,28 +998,10 @@ void MediaCodecSource::onMessageReceived(const sp<AMessage> &msg) {
     {
         sp<AReplyToken> replyID;
         CHECK(msg->senderAwaitsResponse(&replyID));
-        status_t err = OK;
+
         CHECK(msg->findInt64("time-offset-us", &mInputBufferTimeOffsetUs));
 
-        // Propagate the timestamp offset to GraphicBufferSource.
-        if (mIsVideo) {
-            sp<AMessage> params = new AMessage;
-            params->setInt64("time-offset-us", mInputBufferTimeOffsetUs);
-            err = mEncoder->setParameters(params);
-        }
-
         sp<AMessage> response = new AMessage;
-        response->setInt32("err", err);
-        response->postReply(replyID);
-        break;
-    }
-    case kWhatGetFirstSampleSystemTimeUs:
-    {
-        sp<AReplyToken> replyID;
-        CHECK(msg->senderAwaitsResponse(&replyID));
-
-        sp<AMessage> response = new AMessage;
-        response->setInt64("time-us", mFirstSampleSystemTimeUs);
         response->postReply(replyID);
         break;
     }
