@@ -659,15 +659,6 @@ status_t MediaCodecSource::feedEncoderInputBuffers() {
             CHECK(mbuf->meta_data()->findInt64(kKeyTime, &timeUs));
             timeUs += mInputBufferTimeOffsetUs;
 
-            // Due to the extra delay adjustment at the beginning of start/resume,
-            // the adjusted timeUs may be negative if MediaCodecSource goes into pause
-            // state before feeding any buffers to the encoder. Drop the buffer in this
-            // case.
-            if (timeUs < 0) {
-                mbuf->release();
-                return OK;
-            }
-
             // push decoding time for video, or drift time for audio
             if (mIsVideo) {
                 mDecodingTimeQueue.push_back(timeUs);
@@ -986,11 +977,10 @@ void MediaCodecSource::onMessageReceived(const sp<AMessage> &msg) {
 
     case kWhatPause:
     {
-        if (mFlags & FLAG_USE_SURFACE_INPUT) {
-            suspend();
+        if (mFirstSampleSystemTimeUs < 0) {
+            mPausePending = true;
         } else {
-            CHECK(mPuller != NULL);
-            mPuller->pause();
+            onPause();
         }
         break;
     }
