@@ -148,11 +148,6 @@ status_t AudioFlinger::EffectModule::addHandle(EffectHandle *handle)
 ssize_t AudioFlinger::EffectModule::removeHandle(EffectHandle *handle)
 {
     Mutex::Autolock _l(mLock);
-    return removeHandle_l(handle);
-}
-
-ssize_t AudioFlinger::EffectModule::removeHandle_l(EffectHandle *handle)
-{
     size_t size = mHandles.size();
     size_t i;
     for (i = 0; i < size; i++) {
@@ -280,17 +275,6 @@ void AudioFlinger::EffectModule::process()
                                         mConfig.inputCfg.buffer.s32,
                                         mConfig.inputCfg.buffer.frameCount/2);
         }
-        int ret;
-        if (isProcessImplemented()) {
-            // do the actual processing in the effect engine
-            ret = (*mEffectInterface)->process(mEffectInterface,
-                                                   &mConfig.inputCfg.buffer,
-                                                   &mConfig.outputCfg.buffer);
-        } else {
-            if (mConfig.inputCfg.buffer.raw != mConfig.outputCfg.buffer.raw) {
-                size_t frameCnt = mConfig.inputCfg.buffer.frameCount * FCC_2;  //always stereo here
-                int16_t *in = mConfig.inputCfg.buffer.s16;
-                int16_t *out = mConfig.outputCfg.buffer.s16;
 
                 if (mConfig.outputCfg.accessMode == EFFECT_BUFFER_ACCESS_ACCUMULATE) {
                     for (size_t i = 0; i < frameCnt; i++) {
@@ -558,17 +542,6 @@ status_t AudioFlinger::EffectModule::stop_l()
     return status;
 }
 
-// must be called with EffectChain::mLock held
-void AudioFlinger::EffectModule::release_l()
-{
-    if (mEffectInterface != NULL) {
-        remove_effect_from_hal_l();
-        // release effect engine
-        EffectRelease(mEffectInterface);
-        mEffectInterface = NULL;
-    }
-}
-
 status_t AudioFlinger::EffectModule::remove_effect_from_hal_l()
 {
     if ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_PRE_PROC ||
@@ -582,13 +555,6 @@ status_t AudioFlinger::EffectModule::remove_effect_from_hal_l()
         }
     }
     return NO_ERROR;
-}
-
-// round up delta valid if value and divisor are positive.
-template <typename T>
-static T roundUpDelta(const T &value, const T &divisor) {
-    T remainder = value % divisor;
-    return remainder == 0 ? 0 : divisor - remainder;
 }
 
 status_t AudioFlinger::EffectModule::command(uint32_t cmdCode,
@@ -1154,6 +1120,14 @@ AudioFlinger::EffectHandle::EffectHandle(const sp<EffectModule>& effect,
 AudioFlinger::EffectHandle::~EffectHandle()
 {
     ALOGV("Destructor %p", this);
+
+    if (mEffect == 0) {
+        mDestroyed = true;
+        return;
+    }
+    mEffect->lock();
+    mDestroyed = true;
+    mEffect->unlock();
     disconnect(false);
 }
 
@@ -1164,14 +1138,12 @@ status_t AudioFlinger::EffectHandle::initCheck()
 
 status_t AudioFlinger::EffectHandle::enable()
 {
-    AutoMutex _l(mLock);
     ALOGV("enable %p", this);
-    sp<EffectModule> effect = mEffect.promote();
-    if (effect == 0 || mDisconnected) {
-        return DEAD_OBJECT;
-    }
     if (!mHasControl) {
         return INVALID_OPERATION;
+    }
+    if (mEffect == 0) {
+        return DEAD_OBJECT;
     }
 
     if (mEnabled) {
@@ -1228,6 +1200,9 @@ status_t AudioFlinger::EffectHandle::disable()
     if (!mHasControl) {
         return INVALID_OPERATION;
     }
+    if (mEffect == 0) {
+        return DEAD_OBJECT;
+    }
 
     if (!mEnabled) {
         return NO_ERROR;
@@ -1255,7 +1230,6 @@ status_t AudioFlinger::EffectHandle::disable()
 
 void AudioFlinger::EffectHandle::disconnect()
 {
-    ALOGV("%s %p", __FUNCTION__, this);
     disconnect(true);
 }
 
@@ -1288,6 +1262,8 @@ void AudioFlinger::EffectHandle::disconnect(bool unpinIfLast)
         }
     }
 
+    // release sp on module => module destructor can be called now
+    mEffect.clear();
     if (mClient != 0) {
         if (mCblk != NULL) {
             // unlike ~TrackBase(), mCblk is never a local new, so don't delete
@@ -1309,50 +1285,12 @@ status_t AudioFlinger::EffectHandle::command(uint32_t cmdCode,
     ALOGVV("command(), cmdCode: %d, mHasControl: %d, mEffect: %p",
             cmdCode, mHasControl, mEffect.unsafe_get());
 
-    // reject commands reserved for internal use by audio framework if coming from outside
-    // of audioserver
-    switch(cmdCode) {
-        case EFFECT_CMD_ENABLE:
-        case EFFECT_CMD_DISABLE:
-        case EFFECT_CMD_SET_PARAM:
-        case EFFECT_CMD_SET_PARAM_DEFERRED:
-        case EFFECT_CMD_SET_PARAM_COMMIT:
-        case EFFECT_CMD_GET_PARAM:
-            break;
-        default:
-            if (cmdCode >= EFFECT_CMD_FIRST_PROPRIETARY) {
-                break;
-            }
-            android_errorWriteLog(0x534e4554, "62019992");
-            return BAD_VALUE;
-    }
-
-    if (cmdCode == EFFECT_CMD_ENABLE) {
-        if (*replySize < sizeof(int)) {
-            android_errorWriteLog(0x534e4554, "32095713");
-            return BAD_VALUE;
-        }
-        *(int *)pReplyData = NO_ERROR;
-        *replySize = sizeof(int);
-        return enable();
-    } else if (cmdCode == EFFECT_CMD_DISABLE) {
-        if (*replySize < sizeof(int)) {
-            android_errorWriteLog(0x534e4554, "32095713");
-            return BAD_VALUE;
-        }
-        *(int *)pReplyData = NO_ERROR;
-        *replySize = sizeof(int);
-        return disable();
-    }
-
-    AutoMutex _l(mLock);
-    sp<EffectModule> effect = mEffect.promote();
-    if (effect == 0 || mDisconnected) {
-        return DEAD_OBJECT;
-    }
     // only get parameter command is permitted for applications not controlling the effect
     if (!mHasControl && cmdCode != EFFECT_CMD_GET_PARAM) {
         return INVALID_OPERATION;
+    }
+    if (mEffect == 0) {
+        return DEAD_OBJECT;
     }
     if (mClient == 0) {
         return INVALID_OPERATION;
@@ -1360,13 +1298,6 @@ status_t AudioFlinger::EffectHandle::command(uint32_t cmdCode,
 
     // handle commands that are not forwarded transparently to effect engine
     if (cmdCode == EFFECT_CMD_SET_PARAM_COMMIT) {
-        if (*replySize < sizeof(int)) {
-            android_errorWriteLog(0x534e4554, "32095713");
-            return BAD_VALUE;
-        }
-        *(int *)pReplyData = NO_ERROR;
-        *replySize = sizeof(int);
-
         // No need to trylock() here as this function is executed in the binder thread serving a
         // particular client process:  no risk to block the whole media server process or mixer
         // threads if we are stuck here
@@ -1389,7 +1320,6 @@ status_t AudioFlinger::EffectHandle::command(uint32_t cmdCode,
                     || size > EFFECT_PARAM_BUFFER_SIZE
                     || ((uint8_t *)p + size) > mBuffer + clientIndex) {
                 ALOGW("command(): invalid parameter block size");
-                status = BAD_VALUE;
                 break;
             }
 
@@ -1409,15 +1339,6 @@ status_t AudioFlinger::EffectHandle::command(uint32_t cmdCode,
                                             param,
                                             &rsize,
                                             &reply);
-
-            // verify shared memory: server index shouldn't change; client index can't go back.
-            if (serverIndex != mCblk->serverIndex
-                    || clientIndex > mCblk->clientIndex) {
-                android_errorWriteLog(0x534e4554, "32220769");
-                status = BAD_VALUE;
-                break;
-            }
-
             // stop at first error encountered
             if (ret != NO_ERROR) {
                 status = ret;
@@ -1429,10 +1350,15 @@ status_t AudioFlinger::EffectHandle::command(uint32_t cmdCode,
             }
             index += size;
         }
-        free(param);
         mCblk->serverIndex = 0;
         mCblk->clientIndex = 0;
         return status;
+    } else if (cmdCode == EFFECT_CMD_ENABLE) {
+        *(int *)pReplyData = NO_ERROR;
+        return enable();
+    } else if (cmdCode == EFFECT_CMD_DISABLE) {
+        *(int *)pReplyData = NO_ERROR;
+        return disable();
     }
 
     return effect->command(cmdCode, cmdSize, pCmdData, replySize, pReplyData);
@@ -1517,6 +1443,7 @@ AudioFlinger::EffectChain::~EffectChain()
     if (mOwnInBuffer) {
         delete mInBuffer;
     }
+
 }
 
 // getEffectFromDesc_l() must be called with ThreadBase::mLock held
@@ -1655,15 +1582,10 @@ status_t AudioFlinger::EffectChain::createEffect_l(sp<EffectModule>& effect,
 // addEffect_l() must be called with ThreadBase::mLock held
 status_t AudioFlinger::EffectChain::addEffect_l(const sp<EffectModule>& effect)
 {
-    Mutex::Autolock _l(mLock);
-    return addEffect_ll(effect);
-}
-// addEffect_l() must be called with ThreadBase::mLock and EffectChain::mLock held
-status_t AudioFlinger::EffectChain::addEffect_ll(const sp<EffectModule>& effect)
-{
     effect_descriptor_t desc = effect->desc();
     uint32_t insertPref = desc.flags & EFFECT_FLAG_INSERT_MASK;
 
+    Mutex::Autolock _l(mLock);
     effect->setChain(this);
     sp<ThreadBase> thread = mThread.promote();
     if (thread == 0) {
@@ -1790,10 +1712,6 @@ size_t AudioFlinger::EffectChain::removeEffect_l(const sp<EffectModule>& effect,
                     mEffects[i]->state() == EffectModule::STOPPING) {
                 mEffects[i]->stop();
             }
-            if (release) {
-                mEffects[i]->release_l();
-            }
-
             if (type == EFFECT_FLAG_TYPE_AUXILIARY) {
                 delete[] effect->inBuffer();
             } else {
@@ -1805,7 +1723,6 @@ size_t AudioFlinger::EffectChain::removeEffect_l(const sp<EffectModule>& effect,
             mEffects.removeAt(i);
             ALOGV("removeEffect_l() effect %p, removed from chain %p at rank %zu", effect.get(),
                     this, i);
-
             break;
         }
     }
