@@ -58,6 +58,7 @@
 #include "SpdifStreamOut.h"
 #include "AudioHwDevice.h"
 #include "LinearMap.h"
+#include "LockWatch.h"
 
 #include <powermanager/IPowerManager.h>
 
@@ -631,6 +632,7 @@ private:
     };
 
     mutable     Mutex                               mLock;
+                sp<LockWatch>                       mLockWatch;
                 // protects mClients and mNotificationClients.
                 // must be locked after mLock and ThreadBase::mLock if both must be locked
                 // avoids acquiring AudioFlinger::mLock from inside thread loop.
