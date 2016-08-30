@@ -108,6 +108,13 @@ status_t CaptureRequest::writeToParcel(Parcel* parcel) const {
     parcel->writeInt32(size);
 
     for (int32_t i = 0; i < size; ++i) {
+        sp<Surface> surface = mSurfaceList[i];
+
+        sp<IBinder> binder;
+        if (surface != 0) {
+            binder = IInterface::asBinder(surface->getIGraphicBufferProducer());
+        }
+
         // not sure if readParcelableArray does this, hard to tell from source
         parcel->writeString16(String16("android.view.Surface"));
 
